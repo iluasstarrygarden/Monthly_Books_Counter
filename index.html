@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>Monthly Books Read</title>
+
+<style>
+body {
+  margin: 0;
+  background: transparent;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+}
+
+.panel {
+  width: 200px;
+  height: 220px;
+  background: #F4E6D8;
+  border-radius: 28px;
+  border: 1px solid #E6D3C3;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.05);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.content {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.number {
+  font-family: Georgia, serif;
+  font-size: 125px;
+  color: #C29563;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.stars {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  font-family: serif;
+}
+
+.star {
+  position: absolute;
+  color: #D8A35F;
+  opacity: 0.75;
+  animation: twinkle 4s ease-in-out infinite;
+}
+
+.star.light { color: #E7B877; }
+.star.soft { color: #C99956; opacity: 0.6; }
+
+@keyframes twinkle {
+  0%, 100% { opacity: 0.2; transform: scale(0.9); }
+  50% { opacity: 0.85; transform: scale(1.15); }
+}
+</style>
+</head>
+
+<body>
+
+<div class="panel">
+
+  <div class="stars">
+    <span class="star" style="top:15%; left:20%; font-size:16px;">✦</span>
+    <span class="star light" style="top:25%; left:75%; font-size:14px;">✧</span>
+    <span class="star soft" style="top:60%; left:18%; font-size:12px;">✦</span>
+    <span class="star" style="top:70%; left:70%; font-size:15px;">✧</span>
+    <span class="star light" style="top:40%; left:50%; font-size:13px;">✦</span>
+    <span class="star soft" style="top:82%; left:45%; font-size:11px;">✧</span>
+  </div>
+
+  <div class="content">
+    <div class="number" id="counter">0</div>
+  </div>
+
+</div>
+
+<script>
+async function getMonthlyCount() {
+  const res = await fetch("/api/monthly?t=" + Date.now());
+  const data = await res.json();
+  return data.count ?? 0;
+}
+
+async function animateCounter() {
+  const counter = document.getElementById("counter");
+  const total = await getMonthlyCount();
+
+  let current = 0;
+  const step = Math.max(1, Math.ceil(total / 60));
+
+  const interval = setInterval(() => {
+    current += step;
+    if (current >= total) {
+      current = total;
+      clearInterval(interval);
+    }
+    counter.textContent = current;
+  }, 30);
+}
+
+animateCounter();
+</script>
+
+</body>
+</html>
