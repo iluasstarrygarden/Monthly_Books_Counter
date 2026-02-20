@@ -7,55 +7,51 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing Notion env vars" });
     }
 
-    // Current month range (local server time; good enough for this use)
+    // --- Month boundaries (start of this month -> start of next month), UTC-safe ---
     const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const startOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0));
+    const startOfNextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0));
 
-    // Notion wants ISO strings
     const startISO = startOfMonth.toISOString();
-    const endISO = startOfNextMonth.toISOString();
+    const nextISO = startOfNextMonth.toISOString();
 
-    let count = 0;
-    let hasMore = true;
-    let startCursor = undefined;
+    // --- We treat "Finished" as any Status text containing 📘 (covers 📘 and 📘✨ ARC) ---
+    // If your End Date property name is different, rename "End Date" below.
+    const makeBody = (filterVariant) => {
+      // filterVariant lets us switch between rich_text vs select if needed
+      const statusFilter =
+        filterVariant === "rich_text"
+          ? { property: "Status", rich_text: { contains: "📘" } }
+          : { property: "Status", select: { contains: "📘" } };
 
-    while (hasMore) {
-      const body = {
+      return {
         page_size: 100,
         filter: {
           and: [
-            // End Date is within this month
+            statusFilter,
             {
               property: "End Date",
-              date: {
-                on_or_after: startISO,
-                before: endISO
-              }
+              date: { on_or_after: startISO }
             },
-
-            // Status text is one of your "finished" values
             {
-              or: [
-                {
-                  property: "Status",
-                  rich_text: { equals: "📘" }
-                },
-                {
-                  property: "Status",
-                  rich_text: { equals: "📘✨ ARC" }
-                }
-              ]
+              property: "End Date",
+              date: { before: nextISO }
             }
           ]
         }
       };
+    };
 
-      if (startCursor) body.start_cursor = startCursor;
+    async function runQuery(filterVariant) {
+      let count = 0;
+      let hasMore = true;
+      let startCursor = undefined;
 
-      const resp = await fetch(
-        `https://api.notion.com/v1/databases/${DATABASE_ID}/query`,
-        {
+      while (hasMore) {
+        const body = makeBody(filterVariant);
+        if (startCursor) body.start_cursor = startCursor;
+
+        const resp = await fetch(`https://api.notion.com/v1/databases/${DATABASE_ID}/query`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${NOTION_TOKEN}`,
@@ -63,21 +59,42 @@ export default async function handler(req, res) {
             "Content-Type": "application/json"
           },
           body: JSON.stringify(body)
+        });
+
+        const data = await resp.json();
+
+        if (!resp.ok) {
+          // bubble up the exact Notion error (super useful for debugging)
+          const err = new Error(JSON.stringify(data));
+          err.status = resp.status;
+          throw err;
         }
-      );
 
-      const data = await resp.json();
-      if (!resp.ok) return res.status(resp.status).json(data);
+        count += (data.results?.length || 0);
+        hasMore = data.has_more;
+        startCursor = data.next_cursor;
+      }
 
-      count += (data.results?.length || 0);
-      hasMore = data.has_more;
-      startCursor = data.next_cursor;
+      return count;
     }
 
-    // While debugging, keep cache short so tests show quickly
-    res.setHeader("Cache-Control", "s-maxage=20, stale-while-revalidate=60");
+    let count;
+    try {
+      // Your Status is text -> this should work
+      count = await runQuery("rich_text");
+    } catch (e) {
+      // Fallback if Status is actually a Select property
+      // (If this also errors, we’ll need the exact property types/names.)
+      count = await runQuery("select");
+    }
+
+    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=600");
     return res.status(200).json({ count });
   } catch (err) {
-    return res.status(500).json({ error: String(err) });
+    return res.status(500).json({
+      error: String(err),
+      hint:
+        "If this mentions 'validation_error', double-check property names are exactly 'Status' and 'End Date'. If it mentions 404, check env vars + database sharing."
+    });
   }
 }
