@@ -7,18 +7,14 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing Notion env vars" });
     }
 
-    // --- IMPORTANT: match your Notion property names EXACTLY ---
-    const STATUS_PROPERTY = "Status";     // your text status property
-    const DATE_PROPERTY = "End Date";     // the date you set when you finish a book
-
-    // Your exact finished labels (including emoji)
-    const FINISHED_REGULAR = "📘";
-    const FINISHED_ARC = "📘✨ ARC";
-
-    // Current month range
+    // Current month range (local server time; good enough for this use)
     const now = new Date();
-    const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0));
-    const startOfNextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0));
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+
+    // Notion wants ISO strings
+    const startISO = startOfMonth.toISOString();
+    const endISO = startOfNextMonth.toISOString();
 
     let count = 0;
     let hasMore = true;
@@ -29,24 +25,27 @@ export default async function handler(req, res) {
         page_size: 100,
         filter: {
           and: [
+            // End Date is within this month
+            {
+              property: "End Date",
+              date: {
+                on_or_after: startISO,
+                before: endISO
+              }
+            },
+
+            // Status text is one of your "finished" values
             {
               or: [
                 {
-                  property: STATUS_PROPERTY,
-                  rich_text: { equals: FINISHED_REGULAR }
+                  property: "Status",
+                  rich_text: { equals: "📘" }
                 },
                 {
-                  property: STATUS_PROPERTY,
-                  rich_text: { equals: FINISHED_ARC }
+                  property: "Status",
+                  rich_text: { equals: "📘✨ ARC" }
                 }
               ]
-            },
-            {
-              property: DATE_PROPERTY,
-              date: {
-                on_or_after: startOfMonth.toISOString(),
-                before: startOfNextMonth.toISOString()
-              }
             }
           ]
         }
@@ -75,12 +74,9 @@ export default async function handler(req, res) {
       startCursor = data.next_cursor;
     }
 
-    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=600");
-    return res.status(200).json({
-      count,
-      month: now.getUTCMonth() + 1,
-      year: now.getUTCFullYear()
-    });
+    // While debugging, keep cache short so tests show quickly
+    res.setHeader("Cache-Control", "s-maxage=20, stale-while-revalidate=60");
+    return res.status(200).json({ count });
   } catch (err) {
     return res.status(500).json({ error: String(err) });
   }
