@@ -6,24 +6,23 @@ export default async function handler(req, res) {
     // PST = -480, PDT = -420
     const TZ_OFFSET_MINUTES = Number(process.env.NOTION_TZ_OFFSET_MINUTES ?? -480);
 
+    // If your date property name ever changes, set:
+    // END_DATE_PROP=End Date
+    const END_DATE_PROP = process.env.END_DATE_PROP ?? "End Date";
+
     if (!NOTION_TOKEN || !DATABASE_ID) {
       return res.status(500).json({ error: "Missing Notion env vars" });
     }
 
-    // --- helpers ---
-    // Convert a Date -> "local" time by applying offset minutes, then extract Y/M/D safely.
     function getLocalParts(dateUtc, offsetMinutes) {
       const localMs = dateUtc.getTime() + offsetMinutes * 60_000;
       const d = new Date(localMs);
-      return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate() };
+      return { y: d.getUTCFullYear(), m: d.getUTCMonth(), day: d.getUTCDate() };
     }
 
-    // Build month range [start, end) in UTC ISO, based on the user's offset.
-    // We compute "local" month boundaries, then convert back to UTC by subtracting offset.
     function getMonthRangeUtcISO(nowUtc, offsetMinutes) {
       const { y, m } = getLocalParts(nowUtc, offsetMinutes);
 
-      // Local month start (as if it's UTC) then convert to real UTC by subtracting offset
       const localStartAsUtc = new Date(Date.UTC(y, m, 1, 0, 0, 0));
       const localEndAsUtc = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0));
 
@@ -36,17 +35,14 @@ export default async function handler(req, res) {
     const now = new Date();
     const { startISO, endISO, y, m } = getMonthRangeUtcISO(now, TZ_OFFSET_MINUTES);
 
-    // ✅ Strict AND:
-    // - Status contains 📘 (counts 📘 and 📘✨ ARC)
-    // - End Date is within this month
     const filter = {
       and: [
         {
           property: "Status",
-          rich_text: { contains: "📘" }
+          rich_text: { contains: "📘" } // counts 📘 and 📘✨ ARC
         },
         {
-          property: "End Date",
+          property: END_DATE_PROP,
           date: {
             on_or_after: startISO,
             before: endISO
@@ -58,6 +54,9 @@ export default async function handler(req, res) {
     let count = 0;
     let hasMore = true;
     let startCursor = undefined;
+
+    // Collect sample matches for debug (title + end date)
+    const debugMatches = [];
 
     while (hasMore) {
       const body = { page_size: 100, filter };
@@ -76,15 +75,42 @@ export default async function handler(req, res) {
       const data = await resp.json();
       if (!resp.ok) return res.status(resp.status).json(data);
 
-      count += (data.results?.length || 0);
+      const results = data.results ?? [];
+      count += results.length;
+
+      // Grab up to 25 entries for debug so we can see WHAT is being counted
+      if (req.query?.debug === "1" && debugMatches.length < 25) {
+        for (const page of results) {
+          const props = page.properties ?? {};
+
+          // Title property: usually the database title field (unknown key),
+          // so we search for the first "title" type property.
+          let title = "(Untitled)";
+          for (const key of Object.keys(props)) {
+            if (props[key]?.type === "title") {
+              const parts = props[key].title ?? [];
+              title = parts.map(t => t.plain_text).join("") || "(Untitled)";
+              break;
+            }
+          }
+
+          const endDate = props[END_DATE_PROP]?.date?.start ?? null;
+
+          debugMatches.push({
+            title,
+            endDate
+          });
+
+          if (debugMatches.length >= 25) break;
+        }
+      }
+
       hasMore = data.has_more;
       startCursor = data.next_cursor;
     }
 
-    // While debugging, don’t cache hard
     res.setHeader("Cache-Control", "no-store");
 
-    // Optional debug: /api/monthly?debug=1
     if (req.query?.debug === "1") {
       return res.status(200).json({
         count,
@@ -92,7 +118,9 @@ export default async function handler(req, res) {
         month: `${y}-${String(m + 1).padStart(2, "0")}`,
         startISO,
         endISO,
-        notes: "Filter = Status contains 📘 AND End Date within month range"
+        end_date_property: END_DATE_PROP,
+        filter_explainer: "Status contains 📘 AND End Date within month",
+        sample_matches: debugMatches
       });
     }
 
