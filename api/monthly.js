@@ -11,66 +11,40 @@ export default async function handler(req, res) {
     }
 
     // --- helpers ---
-    // Convert a Date -> "local" time by applying offset minutes, then extract Y/M safely.
     function getLocalParts(dateUtc, offsetMinutes) {
       const localMs = dateUtc.getTime() + offsetMinutes * 60_000;
       const d = new Date(localMs);
-      return { y: d.getUTCFullYear(), m: d.getUTCMonth() }; // month 0-11
+      return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate() };
     }
 
-    // Build month range [start, end) in UTC ISO, based on the user's offset.
-    function getMonthRangeUtcISO(nowUtc, offsetMinutes) {
-      // Allow forcing a month for testing:
-      // /api/monthly?year=2026&month=2   (month is 1-12)
-      const qYear = req.query?.year ? Number(req.query.year) : null;
-      const qMonth1 = req.query?.month ? Number(req.query.month) : null;
+    function getMonthRangeUtc(nowUtc, offsetMinutes) {
+      const { y, m } = getLocalParts(nowUtc, offsetMinutes);
 
-      let y, m;
-      if (qYear && qMonth1 && qMonth1 >= 1 && qMonth1 <= 12) {
-        y = qYear;
-        m = qMonth1 - 1;
-      } else {
-        ({ y, m } = getLocalParts(nowUtc, offsetMinutes));
-      }
-
+      // “Local month start” represented in UTC, then convert to real UTC by subtracting offset
       const localStartAsUtc = new Date(Date.UTC(y, m, 1, 0, 0, 0));
       const localEndAsUtc = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0));
 
       const startUtc = new Date(localStartAsUtc.getTime() - offsetMinutes * 60_000);
       const endUtc = new Date(localEndAsUtc.getTime() - offsetMinutes * 60_000);
 
-      return { startISO: startUtc.toISOString(), endISO: endUtc.toISOString(), y, m };
+      return { startUtc, endUtc, y, m };
     }
 
     const now = new Date();
-    const { startISO, endISO, y, m } = getMonthRangeUtcISO(now, TZ_OFFSET_MINUTES);
+    const { startUtc, endUtc, y, m } = getMonthRangeUtc(now, TZ_OFFSET_MINUTES);
 
-    // Strict AND:
-    // - Status contains 📘 (counts both 📘 and 📘✨ ARC)
-    // - End Date is within the month window
+    // 1) Ask Notion only for “Finished” (Status contains 📘)
+    //    We'll enforce the month filter locally for maximum reliability.
     const filter = {
-      and: [
-        {
-          property: "Status",
-          rich_text: { contains: "📘" }
-        },
-        {
-          property: "End Date",
-          date: {
-            on_or_after: startISO,
-            before: endISO
-          }
-        }
-      ]
+      property: "Status",
+      rich_text: { contains: "📘" } // counts 📘 and 📘✨ ARC — Due Dec 15
     };
 
-    let count = 0;
+    let finishedThisMonth = 0;
     let hasMore = true;
     let startCursor = undefined;
 
-    // Collect matches for debug
-    const matches = [];
-    const debugMode = req.query?.debug === "1";
+    const matches = []; // for debug
 
     while (hasMore) {
       const body = { page_size: 100, filter };
@@ -89,30 +63,26 @@ export default async function handler(req, res) {
       const data = await resp.json();
       if (!resp.ok) return res.status(resp.status).json(data);
 
-      const results = data.results ?? [];
-      count += results.length;
+      for (const page of data.results ?? []) {
+        const props = page.properties ?? {};
 
-      if (debugMode) {
-        for (const page of results) {
-          const props = page.properties || {};
-          const titleProp = Object.values(props).find((p) => p?.type === "title");
-          const title =
-            titleProp?.title?.map((t) => t.plain_text).join("") ||
-            page.id;
+        // Read End Date safely
+        const endDateObj = props["End Date"]?.date;
+        const endStart = endDateObj?.start ? new Date(endDateObj.start) : null;
 
-          const endDate = props["End Date"]?.date?.start ?? null;
-          const endDateEnd = props["End Date"]?.date?.end ?? null;
+        // STRICT rule: must have BOTH
+        // - Status contains 📘 (already filtered by Notion)
+        // - End Date exists AND falls inside month window
+        if (!endStart || Number.isNaN(endStart.getTime())) continue;
 
-          const statusText =
-            props["Status"]?.rich_text?.map((t) => t.plain_text).join("") ?? null;
+        if (endStart >= startUtc && endStart < endUtc) {
+          finishedThisMonth += 1;
 
-          // cap the debug list so response doesn't get huge
-          if (matches.length < 50) {
+          if (req.query?.debug === "1") {
             matches.push({
-              title,
-              status: statusText,
-              end_date_start: endDate,
-              end_date_end: endDateEnd
+              title: props["Name"]?.title?.[0]?.plain_text ?? "(untitled)",
+              end_date_start: endDateObj.start,
+              end_date_end: endDateObj.end ?? null
             });
           }
         }
@@ -124,19 +94,19 @@ export default async function handler(req, res) {
 
     res.setHeader("Cache-Control", "no-store");
 
-    if (debugMode) {
+    if (req.query?.debug === "1") {
       return res.status(200).json({
-        count,
+        count: finishedThisMonth,
         tz_offset_minutes: TZ_OFFSET_MINUTES,
         month: `${y}-${String(m + 1).padStart(2, "0")}`,
-        startISO,
-        endISO,
-        notes: "Matches = Status contains 📘 AND End Date within [startISO, endISO)",
+        startISO: startUtc.toISOString(),
+        endISO: endUtc.toISOString(),
+        notes: "Counted pages where Status contains 📘 AND End Date is within this month (filtered locally).",
         matches
       });
     }
 
-    return res.status(200).json({ count });
+    return res.status(200).json({ count: finishedThisMonth });
   } catch (err) {
     return res.status(500).json({ error: String(err) });
   }
