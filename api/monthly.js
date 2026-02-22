@@ -4,23 +4,24 @@ export default async function handler(req, res) {
     const DATABASE_ID = process.env.NOTION_DATABASE_ID;
 
     // PST = -480, PDT = -420
+    // If you don't want DST switching, just keep it -480 forever.
     const TZ_OFFSET_MINUTES = Number(process.env.NOTION_TZ_OFFSET_MINUTES ?? -480);
 
     if (!NOTION_TOKEN || !DATABASE_ID) {
       return res.status(500).json({ error: "Missing Notion env vars" });
     }
 
-    // --- helpers ---
+    // ---- Time helpers (month range based on your local offset) ----
     function getLocalParts(dateUtc, offsetMinutes) {
       const localMs = dateUtc.getTime() + offsetMinutes * 60_000;
       const d = new Date(localMs);
-      return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate() };
+      return { y: d.getUTCFullYear(), m: d.getUTCMonth(), day: d.getUTCDate() };
     }
 
     function getMonthRangeUtcISO(nowUtc, offsetMinutes) {
       const { y, m } = getLocalParts(nowUtc, offsetMinutes);
 
-      // local month boundary expressed as UTC, then convert back to real UTC
+      // Local month start/end (constructed in UTC), then convert to real UTC by subtracting offset
       const localStartAsUtc = new Date(Date.UTC(y, m, 1, 0, 0, 0));
       const localEndAsUtc = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0));
 
@@ -33,40 +34,39 @@ export default async function handler(req, res) {
     const now = new Date();
     const { startISO, endISO, y, m } = getMonthRangeUtcISO(now, TZ_OFFSET_MINUTES);
 
-    // ✅ Status rules:
-    // - Regular finished = exactly "📘"
-    // - ARC finished = starts_with "📘✨ ARC" (so it matches "📘✨ ARC — Due Dec 15" too)
-    const statusFilter = {
+    // ---- Status rules (new Notion button output) ----
+    // Regular finished: exactly "📘"
+    // ARC finished: starts with "📘✨ ARC" (may include "— Due MMM DD")
+    //
+    // IMPORTANT:
+    // - We do NOT match "📖✨ ARC" (started ARC) anymore.
+    // - We do NOT use "contains 📘" because that can overcount.
+    const finishedStatusFilter = {
       or: [
         { property: "Status", rich_text: { equals: "📘" } },
         { property: "Status", rich_text: { starts_with: "📘✨ ARC" } }
       ]
     };
 
-    // ✅ Date rules:
-    // - MUST have End Date
-    // - End Date must be within this month window
-    const endDateFilter = {
-      and: [
-        { property: "End Date", date: { is_not_empty: true } },
-        {
-          property: "End Date",
-          date: { on_or_after: startISO, before: endISO }
-        }
-      ]
+    const dateFilter = {
+      property: "End Date",
+      date: {
+        on_or_after: startISO,
+        before: endISO
+      }
     };
 
-    // ✅ Strict AND: (Status is finished) AND (End Date is in month)
     const filter = {
-      and: [statusFilter, endDateFilter]
+      and: [finishedStatusFilter, dateFilter]
     };
 
+    // ---- Query + pagination ----
     let count = 0;
     let hasMore = true;
     let startCursor = undefined;
 
-    // For debug mode we’ll collect matches so we can SEE which fields Notion is returning.
-    const matches = [];
+    // Debug matches list (optional)
+    const debugMatches = [];
 
     while (hasMore) {
       const body = { page_size: 100, filter };
@@ -85,35 +85,24 @@ export default async function handler(req, res) {
       const data = await resp.json();
       if (!resp.ok) return res.status(resp.status).json(data);
 
-      const results = data.results || [];
+      const results = data.results ?? [];
       count += results.length;
 
-      // Collect debug info from the actual properties
+      // Collect some debug info (titles/status/end date)
       if (req.query?.debug === "1") {
         for (const page of results) {
           const props = page.properties || {};
-          const titleProp = props.Name || props.Title || props.title || null;
-
+          const titleProp = Object.values(props).find(p => p?.type === "title");
           const title =
             titleProp?.title?.map(t => t.plain_text).join("") ||
-            titleProp?.rich_text?.map(t => t.plain_text).join("") ||
             "(untitled)";
 
-          const statusText =
-            props.Status?.rich_text?.map(t => t.plain_text).join("") ??
-            props.Status?.title?.map(t => t.plain_text).join("") ??
-            props.Status?.select?.name ??
-            "(no status)";
+          const status =
+            props["Status"]?.rich_text?.map(t => t.plain_text).join("") ?? "";
 
-          const endDate = props["End Date"]?.date?.start ?? null;
-          const startDate = props["Start Date"]?.date?.start ?? null;
+          const end = props["End Date"]?.date?.start ?? null;
 
-          matches.push({
-            title,
-            status: statusText,
-            start_date: startDate,
-            end_date: endDate
-          });
+          debugMatches.push({ title, status, end });
         }
       }
 
@@ -130,9 +119,8 @@ export default async function handler(req, res) {
         month: `${y}-${String(m + 1).padStart(2, "0")}`,
         startISO,
         endISO,
-        notes:
-          "Counts pages where Status is finished (📘 or 📘✨ ARC...) AND End Date is within the month range.",
-        matches
+        finished_rules: ['Status equals "📘" OR Status starts_with "📘✨ ARC"'],
+        matches: debugMatches
       });
     }
 
