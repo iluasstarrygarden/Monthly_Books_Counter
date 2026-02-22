@@ -31,7 +31,7 @@ export default async function handler(req, res) {
     const now = new Date();
     const { startISO, endISO, y, m } = getMonthRangeUtcISO(now, TZ_OFFSET_MINUTES);
 
-    // IMPORTANT: match ONLY true "Finished" values
+    // STRICT finished statuses only
     const FINISHED_VALUES = ["📘", "📘✨ ARC"];
 
     const filter = {
@@ -55,8 +55,6 @@ export default async function handler(req, res) {
     let count = 0;
     let hasMore = true;
     let startCursor = undefined;
-
-    // optional: show matches on debug
     const matches = [];
 
     while (hasMore) {
@@ -83,10 +81,8 @@ export default async function handler(req, res) {
           const props = page.properties || {};
           const titleProp = Object.values(props).find((p) => p?.type === "title");
           const title = titleProp?.title?.[0]?.plain_text ?? "(untitled)";
-
           const status = props["Status"]?.rich_text?.map((t) => t.plain_text).join("") ?? "";
           const end = props["End Date"]?.date?.start ?? null;
-
           matches.push({ title, status, end });
         }
       }
@@ -105,7 +101,6 @@ export default async function handler(req, res) {
         startISO,
         endISO,
         finished_values: FINISHED_VALUES,
-        notes: "Matches pages where Status equals a Finished value AND End Date is within month range",
         matches
       });
     }
