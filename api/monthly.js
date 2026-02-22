@@ -10,6 +10,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing Notion env vars" });
     }
 
+    // --- helpers ---
     function getLocalParts(dateUtc, offsetMinutes) {
       const localMs = dateUtc.getTime() + offsetMinutes * 60_000;
       const d = new Date(localMs);
@@ -19,6 +20,7 @@ export default async function handler(req, res) {
     function getMonthRangeUtcISO(nowUtc, offsetMinutes) {
       const { y, m } = getLocalParts(nowUtc, offsetMinutes);
 
+      // local month boundary expressed as UTC, then convert back to real UTC
       const localStartAsUtc = new Date(Date.UTC(y, m, 1, 0, 0, 0));
       const localEndAsUtc = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0));
 
@@ -31,30 +33,39 @@ export default async function handler(req, res) {
     const now = new Date();
     const { startISO, endISO, y, m } = getMonthRangeUtcISO(now, TZ_OFFSET_MINUTES);
 
-    // STRICT finished statuses only
-    const FINISHED_VALUES = ["📘", "📘✨ ARC"];
+    // ✅ Status rules:
+    // - Regular finished = exactly "📘"
+    // - ARC finished = starts_with "📘✨ ARC" (so it matches "📘✨ ARC — Due Dec 15" too)
+    const statusFilter = {
+      or: [
+        { property: "Status", rich_text: { equals: "📘" } },
+        { property: "Status", rich_text: { starts_with: "📘✨ ARC" } }
+      ]
+    };
 
-    const filter = {
+    // ✅ Date rules:
+    // - MUST have End Date
+    // - End Date must be within this month window
+    const endDateFilter = {
       and: [
-        {
-          or: FINISHED_VALUES.map((val) => ({
-            property: "Status",
-            rich_text: { equals: val }
-          }))
-        },
+        { property: "End Date", date: { is_not_empty: true } },
         {
           property: "End Date",
-          date: {
-            on_or_after: startISO,
-            before: endISO
-          }
+          date: { on_or_after: startISO, before: endISO }
         }
       ]
+    };
+
+    // ✅ Strict AND: (Status is finished) AND (End Date is in month)
+    const filter = {
+      and: [statusFilter, endDateFilter]
     };
 
     let count = 0;
     let hasMore = true;
     let startCursor = undefined;
+
+    // For debug mode we’ll collect matches so we can SEE which fields Notion is returning.
     const matches = [];
 
     while (hasMore) {
@@ -74,16 +85,35 @@ export default async function handler(req, res) {
       const data = await resp.json();
       if (!resp.ok) return res.status(resp.status).json(data);
 
-      count += (data.results?.length || 0);
+      const results = data.results || [];
+      count += results.length;
 
+      // Collect debug info from the actual properties
       if (req.query?.debug === "1") {
-        for (const page of data.results || []) {
+        for (const page of results) {
           const props = page.properties || {};
-          const titleProp = Object.values(props).find((p) => p?.type === "title");
-          const title = titleProp?.title?.[0]?.plain_text ?? "(untitled)";
-          const status = props["Status"]?.rich_text?.map((t) => t.plain_text).join("") ?? "";
-          const end = props["End Date"]?.date?.start ?? null;
-          matches.push({ title, status, end });
+          const titleProp = props.Name || props.Title || props.title || null;
+
+          const title =
+            titleProp?.title?.map(t => t.plain_text).join("") ||
+            titleProp?.rich_text?.map(t => t.plain_text).join("") ||
+            "(untitled)";
+
+          const statusText =
+            props.Status?.rich_text?.map(t => t.plain_text).join("") ??
+            props.Status?.title?.map(t => t.plain_text).join("") ??
+            props.Status?.select?.name ??
+            "(no status)";
+
+          const endDate = props["End Date"]?.date?.start ?? null;
+          const startDate = props["Start Date"]?.date?.start ?? null;
+
+          matches.push({
+            title,
+            status: statusText,
+            start_date: startDate,
+            end_date: endDate
+          });
         }
       }
 
@@ -100,7 +130,8 @@ export default async function handler(req, res) {
         month: `${y}-${String(m + 1).padStart(2, "0")}`,
         startISO,
         endISO,
-        finished_values: FINISHED_VALUES,
+        notes:
+          "Counts pages where Status is finished (📘 or 📘✨ ARC...) AND End Date is within the month range.",
         matches
       });
     }
