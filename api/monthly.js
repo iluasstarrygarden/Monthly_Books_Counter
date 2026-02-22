@@ -4,69 +4,81 @@ export default async function handler(req, res) {
     const DATABASE_ID = process.env.NOTION_DATABASE_ID;
 
     // PST = -480, PDT = -420
-    // If you don't want DST switching, just keep it -480 forever.
+    // If you want it stable all year, keep -480.
     const TZ_OFFSET_MINUTES = Number(process.env.NOTION_TZ_OFFSET_MINUTES ?? -480);
 
     if (!NOTION_TOKEN || !DATABASE_ID) {
       return res.status(500).json({ error: "Missing Notion env vars" });
     }
 
-    // ---- Time helpers (month range based on your local offset) ----
+    // ---- Helpers ----
     function getLocalParts(dateUtc, offsetMinutes) {
       const localMs = dateUtc.getTime() + offsetMinutes * 60_000;
       const d = new Date(localMs);
       return { y: d.getUTCFullYear(), m: d.getUTCMonth(), day: d.getUTCDate() };
     }
 
-    function getMonthRangeUtcISO(nowUtc, offsetMinutes) {
+    function getMonthRangeUtc(nowUtc, offsetMinutes) {
       const { y, m } = getLocalParts(nowUtc, offsetMinutes);
 
-      // Local month start/end (constructed in UTC), then convert to real UTC by subtracting offset
+      // Build local month boundaries as UTC, then shift back to real UTC by subtracting offset
       const localStartAsUtc = new Date(Date.UTC(y, m, 1, 0, 0, 0));
       const localEndAsUtc = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0));
 
       const startUtc = new Date(localStartAsUtc.getTime() - offsetMinutes * 60_000);
       const endUtc = new Date(localEndAsUtc.getTime() - offsetMinutes * 60_000);
 
-      return { startISO: startUtc.toISOString(), endISO: endUtc.toISOString(), y, m };
+      return { startUtc, endUtc, y, m };
+    }
+
+    // Notion date can be:
+    // - "2026-02-20" (date-only)
+    // - "2026-02-20T19:22:00.000-08:00" (datetime)
+    // Convert both into a UTC millisecond timestamp, treating date-only as local midnight.
+    function notionDateToUtcMs(dateStr, offsetMinutes) {
+      if (!dateStr) return null;
+
+      // datetime
+      if (dateStr.includes("T")) {
+        const ms = Date.parse(dateStr);
+        return Number.isFinite(ms) ? ms : null;
+      }
+
+      // date-only: interpret as local midnight -> convert to UTC by subtracting offset
+      const [yy, mm, dd] = dateStr.split("-").map(Number);
+      if (!yy || !mm || !dd) return null;
+
+      const localMidnightAsUtc = Date.UTC(yy, mm - 1, dd, 0, 0, 0);
+      const utcMs = localMidnightAsUtc - offsetMinutes * 60_000;
+      return utcMs;
     }
 
     const now = new Date();
-    const { startISO, endISO, y, m } = getMonthRangeUtcISO(now, TZ_OFFSET_MINUTES);
+    const { startUtc, endUtc, y, m } = getMonthRangeUtc(now, TZ_OFFSET_MINUTES);
 
-    // ---- Status rules (new Notion button output) ----
-    // Regular finished: exactly "📘"
-    // ARC finished: starts with "📘✨ ARC" (may include "— Due MMM DD")
-    //
-    // IMPORTANT:
-    // - We do NOT match "📖✨ ARC" (started ARC) anymore.
-    // - We do NOT use "contains 📘" because that can overcount.
-    const finishedStatusFilter = {
-      or: [
-        { property: "Status", rich_text: { equals: "📘" } },
-        { property: "Status", rich_text: { starts_with: "📘✨ ARC" } }
+    // ---- Query Notion (broad but safe), then enforce month filter locally ----
+    // We query:
+    // - Status equals 📘 OR starts_with 📘✨ ARC
+    // - End Date is not empty
+    const filter = {
+      and: [
+        {
+          or: [
+            { property: "Status", rich_text: { equals: "📘" } },
+            { property: "Status", rich_text: { starts_with: "📘✨ ARC" } }
+          ]
+        },
+        { property: "End Date", date: { is_not_empty: true } }
       ]
     };
 
-    const dateFilter = {
-      property: "End Date",
-      date: {
-        on_or_after: startISO,
-        before: endISO
-      }
-    };
-
-    const filter = {
-      and: [finishedStatusFilter, dateFilter]
-    };
-
-    // ---- Query + pagination ----
-    let count = 0;
+    let counted = 0;
     let hasMore = true;
     let startCursor = undefined;
 
-    // Debug matches list (optional)
     const debugMatches = [];
+    const startMs = startUtc.getTime();
+    const endMs = endUtc.getTime();
 
     while (hasMore) {
       const body = { page_size: 100, filter };
@@ -86,24 +98,37 @@ export default async function handler(req, res) {
       if (!resp.ok) return res.status(resp.status).json(data);
 
       const results = data.results ?? [];
-      count += results.length;
 
-      // Collect some debug info (titles/status/end date)
-      if (req.query?.debug === "1") {
-        for (const page of results) {
-          const props = page.properties || {};
-          const titleProp = Object.values(props).find(p => p?.type === "title");
-          const title =
-            titleProp?.title?.map(t => t.plain_text).join("") ||
-            "(untitled)";
+      for (const page of results) {
+        const props = page.properties || {};
 
-          const status =
-            props["Status"]?.rich_text?.map(t => t.plain_text).join("") ?? "";
+        // Title
+        const titleProp = Object.values(props).find(p => p?.type === "title");
+        const title = titleProp?.title?.map(t => t.plain_text).join("") || "(untitled)";
 
-          const end = props["End Date"]?.date?.start ?? null;
+        // Status text
+        const status = props["Status"]?.rich_text?.map(t => t.plain_text).join("") ?? "";
 
-          debugMatches.push({ title, status, end });
+        // End date
+        const endDateStr = props["End Date"]?.date?.start ?? null;
+        const endMsVal = endDateStr ? notionDateToUtcMs(endDateStr, TZ_OFFSET_MINUTES) : null;
+
+        const inThisMonth =
+          endMsVal != null &&
+          endMsVal >= startMs &&
+          endMsVal < endMs;
+
+        if (req.query?.debug === "1") {
+          debugMatches.push({
+            title,
+            status,
+            end_date_start: endDateStr,
+            end_date_ms: endMsVal,
+            in_this_month: inThisMonth
+          });
         }
+
+        if (inThisMonth) counted += 1;
       }
 
       hasMore = data.has_more;
@@ -112,19 +137,24 @@ export default async function handler(req, res) {
 
     res.setHeader("Cache-Control", "no-store");
 
+    // Version stamp so you can confirm you're hitting THIS code
+    const version = "monthly-v3-local-month-filter";
+
     if (req.query?.debug === "1") {
       return res.status(200).json({
-        count,
+        version,
+        count: counted,
         tz_offset_minutes: TZ_OFFSET_MINUTES,
         month: `${y}-${String(m + 1).padStart(2, "0")}`,
-        startISO,
-        endISO,
-        finished_rules: ['Status equals "📘" OR Status starts_with "📘✨ ARC"'],
+        startISO: startUtc.toISOString(),
+        endISO: endUtc.toISOString(),
+        notes:
+          'Counts pages where Status is exactly "📘" OR starts_with "📘✨ ARC", AND End Date exists, AND End Date falls inside this month (enforced in JS).',
         matches: debugMatches
       });
     }
 
-    return res.status(200).json({ count });
+    return res.status(200).json({ count: counted, version });
   } catch (err) {
     return res.status(500).json({ error: String(err) });
   }
