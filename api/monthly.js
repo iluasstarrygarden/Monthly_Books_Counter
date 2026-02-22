@@ -10,41 +10,54 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing Notion env vars" });
     }
 
-    // --- helpers ---
     function getLocalParts(dateUtc, offsetMinutes) {
       const localMs = dateUtc.getTime() + offsetMinutes * 60_000;
       const d = new Date(localMs);
       return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate() };
     }
 
-    function getMonthRangeUtc(nowUtc, offsetMinutes) {
+    function getMonthRangeUtcISO(nowUtc, offsetMinutes) {
       const { y, m } = getLocalParts(nowUtc, offsetMinutes);
 
-      // “Local month start” represented in UTC, then convert to real UTC by subtracting offset
       const localStartAsUtc = new Date(Date.UTC(y, m, 1, 0, 0, 0));
       const localEndAsUtc = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0));
 
       const startUtc = new Date(localStartAsUtc.getTime() - offsetMinutes * 60_000);
       const endUtc = new Date(localEndAsUtc.getTime() - offsetMinutes * 60_000);
 
-      return { startUtc, endUtc, y, m };
+      return { startISO: startUtc.toISOString(), endISO: endUtc.toISOString(), y, m };
     }
 
     const now = new Date();
-    const { startUtc, endUtc, y, m } = getMonthRangeUtc(now, TZ_OFFSET_MINUTES);
+    const { startISO, endISO, y, m } = getMonthRangeUtcISO(now, TZ_OFFSET_MINUTES);
 
-    // 1) Ask Notion only for “Finished” (Status contains 📘)
-    //    We'll enforce the month filter locally for maximum reliability.
+    // IMPORTANT: match ONLY true "Finished" values
+    const FINISHED_VALUES = ["📘", "📘✨ ARC"];
+
     const filter = {
-      property: "Status",
-      rich_text: { contains: "📘" } // counts 📘 and 📘✨ ARC — Due Dec 15
+      and: [
+        {
+          or: FINISHED_VALUES.map((val) => ({
+            property: "Status",
+            rich_text: { equals: val }
+          }))
+        },
+        {
+          property: "End Date",
+          date: {
+            on_or_after: startISO,
+            before: endISO
+          }
+        }
+      ]
     };
 
-    let finishedThisMonth = 0;
+    let count = 0;
     let hasMore = true;
     let startCursor = undefined;
 
-    const matches = []; // for debug
+    // optional: show matches on debug
+    const matches = [];
 
     while (hasMore) {
       const body = { page_size: 100, filter };
@@ -63,28 +76,18 @@ export default async function handler(req, res) {
       const data = await resp.json();
       if (!resp.ok) return res.status(resp.status).json(data);
 
-      for (const page of data.results ?? []) {
-        const props = page.properties ?? {};
+      count += (data.results?.length || 0);
 
-        // Read End Date safely
-        const endDateObj = props["End Date"]?.date;
-        const endStart = endDateObj?.start ? new Date(endDateObj.start) : null;
+      if (req.query?.debug === "1") {
+        for (const page of data.results || []) {
+          const props = page.properties || {};
+          const titleProp = Object.values(props).find((p) => p?.type === "title");
+          const title = titleProp?.title?.[0]?.plain_text ?? "(untitled)";
 
-        // STRICT rule: must have BOTH
-        // - Status contains 📘 (already filtered by Notion)
-        // - End Date exists AND falls inside month window
-        if (!endStart || Number.isNaN(endStart.getTime())) continue;
+          const status = props["Status"]?.rich_text?.map((t) => t.plain_text).join("") ?? "";
+          const end = props["End Date"]?.date?.start ?? null;
 
-        if (endStart >= startUtc && endStart < endUtc) {
-          finishedThisMonth += 1;
-
-          if (req.query?.debug === "1") {
-            matches.push({
-              title: props["Name"]?.title?.[0]?.plain_text ?? "(untitled)",
-              end_date_start: endDateObj.start,
-              end_date_end: endDateObj.end ?? null
-            });
-          }
+          matches.push({ title, status, end });
         }
       }
 
@@ -96,17 +99,18 @@ export default async function handler(req, res) {
 
     if (req.query?.debug === "1") {
       return res.status(200).json({
-        count: finishedThisMonth,
+        count,
         tz_offset_minutes: TZ_OFFSET_MINUTES,
         month: `${y}-${String(m + 1).padStart(2, "0")}`,
-        startISO: startUtc.toISOString(),
-        endISO: endUtc.toISOString(),
-        notes: "Counted pages where Status contains 📘 AND End Date is within this month (filtered locally).",
+        startISO,
+        endISO,
+        finished_values: FINISHED_VALUES,
+        notes: "Matches pages where Status equals a Finished value AND End Date is within month range",
         matches
       });
     }
 
-    return res.status(200).json({ count: finishedThisMonth });
+    return res.status(200).json({ count });
   } catch (err) {
     return res.status(500).json({ error: String(err) });
   }
